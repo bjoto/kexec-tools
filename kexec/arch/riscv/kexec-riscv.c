@@ -120,7 +120,6 @@ int load_extra_segments(struct kexec_info *info, uint64_t kernel_base,
 			       initrd_base + initrd_size);
 
 		dbgprintf("Base addr for initrd image: 0x%lX\n", initrd_base);
-		min_usable = initrd_base;
 		max_usable = initrd_base;
 	}
 

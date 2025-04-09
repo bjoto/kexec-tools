@@ -16,6 +16,7 @@
 #include <libfdt.h>		/* For DeviceTree handling */
 #include "kexec-riscv.h"
 #include "iomem.h"
+#include <stdbool.h>
 
 const struct arch_map_entry arches[] = {
 	{ "riscv32", KEXEC_ARCH_RISCV },
@@ -309,17 +310,36 @@ void arch_reuse_initrd(void)
 
 }
 
+static bool to_be_excluded(char *str, unsigned long long start, unsigned long long end)
+{
+	if (!strncmp(str, CRASH_KERNEL, strlen(CRASH_KERNEL))) {
+		uint64_t load_start, load_end;
+
+		if (!get_crash_kernel_load_range(&load_start, &load_end) &&
+		    (load_start == start) && (load_end == end))
+			return false;
+
+		return true;
+	}
+
+	if (!strncmp(str, SYSTEM_RAM, strlen(SYSTEM_RAM)) ||
+	    !strncmp(str, KERNEL_CODE, strlen(KERNEL_CODE)) ||
+	    !strncmp(str, KERNEL_DATA, strlen(KERNEL_DATA)))
+		return false;
+	else
+		return true;
+}
+
 int get_memory_ranges(struct memory_range **range, int *num_ranges,
 		      unsigned long kexec_flags)
 {
 	struct memory_ranges sysmem_ranges = {0};
-	int ret = 0;
-
 	const char *iomem = proc_iomem();
-	char line[MAX_LINE], *str;
-	FILE *fp;
+	struct memory_range excl_range;
 	unsigned long long start, end;
-	int consumed, count;
+	int consumed, count, ret = 0;
+	FILE *fp = NULL, *sp = NULL;
+	char line[MAX_LINE], *str;
 
 	fp = fopen(iomem, "r");
 	if (!fp) {
@@ -327,36 +347,55 @@ int get_memory_ranges(struct memory_range **range, int *num_ranges,
 		return -1;
 	}
 
+	sp = fopen(iomem, "r");
+	if (!sp) {
+		fprintf(stderr, "Cannot open %s: %s\n", iomem, strerror(errno));
+		ret = -1;
+		goto err;
+	}
+
+	/*
+	 * Perform two passes: First add all System RAM, and then
+	 * exclude the "Reserved" ranges"
+	 */
 	while (fgets(line, sizeof(line), fp) != 0) {
 		count = sscanf(line, "%llx-%llx : %n", &start, &end, &consumed);
 		if (count != 2)
 			continue;
 		str = line + consumed;
 
-		if (!strncmp(str, SYSTEM_RAM, strlen(SYSTEM_RAM))){
+		if (!strncmp(str, SYSTEM_RAM, strlen(SYSTEM_RAM))) {
 			ret = mem_regions_alloc_and_add(&sysmem_ranges,
 					start, end - start + 1, RANGE_RAM);
 			if (ret) {
 				fprintf(stderr,
 					"Cannot allocate memory for ranges\n");
-				fclose(fp);
-				return -ENOMEM;
+				ret = -ENOMEM;
+				goto err;
 			}
 
-		} else if (!strncmp(str, IOMEM_RESERVED, strlen(IOMEM_RESERVED))){
-			ret = mem_regions_alloc_and_add(&sysmem_ranges,
-					start, end - start + 1, RANGE_RESERVED);
-			if (ret) {
-				fprintf(stderr,
-					"Cannot allocate memory for ranges\n");
-				fclose(fp);
-				return -ENOMEM;
-			}
-		} else
-			continue;
+		}
 	}
 
-	fclose(fp);
+	while (fgets(line, sizeof(line), sp) != 0) {
+		count = sscanf(line, "%llx-%llx : %n", &start, &end, &consumed);
+		if (count != 2)
+			continue;
+		str = line + consumed;
+
+		if (to_be_excluded(str, start, end)) {
+			excl_range.start = start;
+			excl_range.end = end;
+
+			ret = mem_regions_alloc_and_exclude(&sysmem_ranges, &excl_range);
+			if (ret) {
+				fprintf(stderr,
+					"Cannot allocate memory for ranges (exclude)\n");
+				ret = -ENOMEM;
+				goto err;
+			}
+		}
+	}
 
 	*range = sysmem_ranges.ranges;
 	*num_ranges = sysmem_ranges.size;
@@ -364,7 +403,13 @@ int get_memory_ranges(struct memory_range **range, int *num_ranges,
 	dbgprint_mem_range("System RAM ranges;",
 				sysmem_ranges.ranges, sysmem_ranges.size);
 
-	return 0;
+	ret = 0;
+ err:
+	if (fp)
+		fclose(fp);
+	if (sp)
+		fclose(sp);
+	return ret;
 }
 
 /*******\
